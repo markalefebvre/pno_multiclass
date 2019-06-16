@@ -1,0 +1,505 @@
+# -*- coding: utf-8 -*-
+"""
+Created on Tue Mar 19 13:12:31 2019
+
+@author: mlefebvre
+"""
+import pyodbc 
+import pandas as pd
+import featuretools as ft
+import numpy as np
+from functools import reduce
+from datetime import datetime 
+import h2o
+import importlib.util
+
+
+def _getToday():
+    return datetime.now().strftime("%Y_%m_%d_%HH%MM")
+
+######
+h2o.init()
+
+
+cnxn = pyodbc.connect("Driver={SQL Server Native Client 11.0};"
+                      "Server=10.235.135.40;"
+                      "Database=hor_com_q_ecr_34;"
+                      "Trusted_Connection=yes;"
+                      "user=mlefebvre;"
+                      "password=FirstLogin!10042018;")
+
+cursor = cnxn.cursor()
+#########################
+
+def merge_data(cnxn, cursor,episode):
+
+    spec.loader.exec_module(episode)
+
+    p_c = 'SELECT * FROM sandbox.qa.pcm'
+    fin_c = 'SELECT * FROM sandbox.qa.pmf'
+    other_c = 'SELECT * FROM Sandbox.qa.pmo'
+
+
+    p_combo = pd.read_sql(p_c, cnxn)
+    fin_c = pd.read_sql(fin_c, cnxn)
+    other_c = pd.read_sql(other_c, cnxn)
+
+
+    def make_id(df):
+        str_id = df.apply(lambda x: '_'.join(map(str,x)),axis=1)
+        return pd.factorize(str_id)[0]
+
+    p_combo['c_id'] = make_id(p_combo[['AttributedProviderId','set']]).astype('str')
+
+    u_id = p_combo[['c_id','AttributedProviderId','set']].astype('str')
+
+    fin_c = pd.merge(fin_c, u_id, left_on=['AttributedProviderId','set'], right_on=['AttributedProviderId','set'], how='inner')
+    other_c = pd.merge(other_c, u_id, left_on=['AttributedProviderId','set'], right_on=['AttributedProviderId','set'],how='inner')
+
+    fin_c['index_id'] = fin_c.index.astype('str')
+    other_c['index_id'] = other_c.index.astype('str')
+    
+    for col in ['facility_npi']:
+        p_combo[col] = p_combo[col].astype('str')
+          
+    for col in ['Claimtype', 'EpisodeAcronym', 'TriggeredDxCode','TriggeredPxCode',
+       'ServiceAssignmentType', 'PlaceOfServiceCode', 'TriggerPhaseName',
+       'ComplicationCode', 'line', 'DrgCode', 'RuleSpec']:
+        other_c[col] = other_c[col].astype('category')
+        
+#    fin_c.drop('TriggeredDxCode', axis=1, inplace=True)
+    print("data imported")
+
+    return p_combo, fin_c, other_c, u_id
+
+def feature(provider, data):
+    from featuretools.primitives import make_agg_primitive, make_trans_primitive
+
+    def range_calc(numeric):
+        return np.max(numeric) - np.min(numeric)
+
+    range_ = make_agg_primitive(function = range_calc,
+                                input_types = [ft.variable_types.Numeric],
+                                return_type = ft.variable_types.Numeric)
+    
+    def p_corr_calc(numeric1, numeric2):
+        return np.corrcoef(numeric1, numeric2)[0,1]
+
+    pcorr_ = make_agg_primitive(function = p_corr_calc,
+                                input_types = [ft.variable_types.Numeric, ft.variable_types.Numeric],
+                                return_type = ft.variable_types.Numeric)
+
+    es = ft.EntitySet(id = 'pno_t')
+    es.entity_from_dataframe(entity_id = 'provider', dataframe = provider, index = 'c_id')
+    es.entity_from_dataframe(entity_id = 'data', dataframe = data, index = 'index_id', 
+                             variable_types={'c_id':ft.variable_types.Text,
+                                             'AttributedProviderId':ft.variable_types.Text,
+                                             'set':ft.variable_types.Text,
+                                             'index_id':ft.variable_types.Text,
+                                             'age': ft.variable_types.Numeric,
+                                             'SplitTypicalCost':ft.variable_types.Numeric,
+                                             'SplitTypicalComplicationCost':ft.variable_types.Numeric,
+                                             'SplitPacCost':ft.variable_types.Numeric,
+                                             'UnsplitTypicalCost':ft.variable_types.Numeric,
+                                             'UnsplitTypicalComplicationcost':ft.variable_types.Numeric,
+                                             'UnsplitPacCost':ft.variable_types.Numeric
+                                             })
+
+    new_relationship = ft.Relationship(es['provider']['c_id'],
+                                       es['data']['c_id'])
+
+    es = es.add_relationship(new_relationship)
+
+    feature_matrix, feature_defs = ft.dfs(entityset=es,
+                                          target_entity="provider",
+                                          agg_primitives = ['min', 'max', 'mean', 'percent_true', 'all', 'any',
+                                                            'sum', 'skew', 'std','median','count', 
+                                                       #    'avg_time_between',
+                                                       #    'n_most_common',
+                                                       #    'last',
+                                                       #    'time_since_last',
+                                                       #    'trend',         
+                                                             range_, pcorr_],
+                                         trans_primitives =[], #['subtract','divide'],# [log_, sqrt_], 
+                                          max_depth = 12,
+                         )
+    feature_matrix = pd.get_dummies(feature_matrix)
+    
+    drop_cols = []
+    for col in feature_matrix:
+        if col == 'AttributedProviderId':
+            pass
+        else:
+            if 'AttributedProviderId' in col:
+                drop_cols.append(col)
+
+    feature_matrix = feature_matrix[[x for x in feature_matrix if x not in drop_cols]] 
+    
+    drop_cols = []
+    for col in feature_matrix:
+        if col == 'index_id':
+            pass
+        else:
+            if 'index_id' in col:
+                drop_cols.append(col)
+
+    feature_matrix = feature_matrix[[x for x in feature_matrix if x not in drop_cols]] 
+    
+    feature_matrix = feature_matrix.dropna(how='all',axis=1)
+    
+#    categories = list(feature_matrix.loc[:,feature_matrix.dtypes == 'uint8'].columns)
+    
+    feature_matrix = feature_matrix.loc[(feature_matrix.sum(axis=1) != 0), (feature_matrix.sum(axis=0) != 0)] 
+    corr_matrix = feature_matrix.corr()
+    # Extract the upper triangle of the correlation matrix
+    upper = corr_matrix.where(np.triu(np.ones(corr_matrix.shape), k = 1).astype(np.bool))
+
+    # Select the features with correlations above the threshold
+    # Need to use the absolute value
+    to_drop = [column for column in upper.columns if any(upper[column].abs() > .99)]
+    
+    n_collinear = len(to_drop)
+    
+    feature_matrix = feature_matrix[[x for x in feature_matrix if x not in to_drop]]
+    print('{} collinear columns removed with correlation above {}.'.format(n_collinear,  .99))
+
+    feature_matrix['c_id'] = feature_matrix.index
+    
+    return feature_matrix
+    
+
+def feature_other(provider,other):
+
+    es = ft.EntitySet(id = 'pno_t')
+    es.entity_from_dataframe(entity_id = 'provider', dataframe = provider, index = 'c_id')
+#    es.entity_from_dataframe(entity_id = 'data', dataframe = data, index = 'index_id')
+    es.entity_from_dataframe(entity_id = 'other', dataframe = other, index = 'index_id', 
+                             variable_types = {'c_id':ft.variable_types.Text,
+                                               'AttributedProviderId':ft.variable_types.Text,
+                                               'set':ft.variable_types.Text,
+                                               'index_id':ft.variable_types.Text,
+                                               'Claimtype':ft.variable_types.Categorical, 
+                                               'EpisodeAcronym':ft.variable_types.Categorical, 
+                                               'TriggeredDxCode':ft.variable_types.Categorical,
+                                               'TriggeredPxCode':ft.variable_types.Categorical,
+                                               'ServiceAssignmentType':ft.variable_types.Categorical, 
+                                               'PlaceOfServiceCode':ft.variable_types.Categorical, 
+                                               'TriggerPhaseName':ft.variable_types.Categorical,
+                                               'ComplicationCode':ft.variable_types.Categorical, 
+                                               'line':ft.variable_types.Categorical, 
+                                               'DrgCode':ft.variable_types.Categorical,
+                                               'RuleSpec':ft.variable_types.Categorical}
+                             )
+
+    other_relationship = ft.Relationship(es['provider']['c_id'],
+                                         es['other']['c_id'])
+
+    es = es.add_relationship(other_relationship)
+    
+    feature_matrix, feature_defs = ft.dfs(entityset=es,
+                                          target_entity="provider",
+                                          max_depth = 2,
+                                          )
+    
+    feature_matrix = pd.get_dummies(feature_matrix)
+    
+    drop_cols = []
+    for col in feature_matrix:
+        if col == 'AttributedProviderId':
+            pass
+        else:
+            if 'AttributedProviderId' in col:
+                drop_cols.append(col)
+
+    feature_matrix = feature_matrix[[x for x in feature_matrix if x not in drop_cols]]    
+
+    corr_matrix = feature_matrix.corr()
+    # Extract the upper triangle of the correlation matrix
+    upper = corr_matrix.where(np.triu(np.ones(corr_matrix.shape), k = 1).astype(np.bool))
+
+    # Select the features with correlations above the threshold
+    # Need to use the absolute value
+    to_drop = [column for column in upper.columns if any(upper[column].abs() > .99)]
+    
+    n_collinear = len(to_drop)
+    
+    feature_matrix = feature_matrix[[x for x in feature_matrix if x not in to_drop]]
+    print('{} collinear columns removed with correlation above {}.'.format(n_collinear,  .99))
+
+    feature_matrix['c_id'] = feature_matrix.index
+    feature_matrix = feature_matrix.reset_index(drop=True)
+    return feature_matrix
+
+def merge_dfs(x,y,z):
+    dfs = [x,y,z]
+    final = reduce(lambda left,right: pd.merge(left,right,on='c_id'), dfs)
+    
+    for i,col in enumerate(final.select_dtypes('uint8')):
+        final[col] = final[col].astype('str')
+        
+    final = final.fillna(0)
+        
+    train = final[final.set=='train']
+    test = final[final.set=='test']
+    
+    train.drop(['c_id', 'set'],axis=1,inplace=True)
+    test.drop(['c_id', 'set'],axis=1,inplace=True)
+
+    print('Merging Complete :' , final.head(5))
+    return train,test
+
+def model(cnxn,cursor,path,episode):
+
+    filename = "%s_%s.%s" % ("",_getToday(),"csv")
+    
+    p_combo, fin_c, other_c, u_id = merge_data(cnxn,cursor,episode)
+    c_fin_ft = feature(u_id, fin_c)
+
+    c_ft_other = feature_other(u_id, other_c)
+    train,test = merge_dfs(p_combo,c_fin_ft, c_ft_other)
+
+    binaryCol = list(train.loc[:,train.dtypes == object].columns)
+    nonBinaryCol = list(train.loc[:,train.dtypes=='float64'].columns)
+
+    train_hf = h2o.H2OFrame(train)
+    test_hf = h2o.H2OFrame(test)
+
+    for c in binaryCol:
+        train_hf[c] = train_hf[c].asfactor()
+        test_hf[c] = test_hf[c].asfactor()
+    
+    for c in nonBinaryCol:
+        train_hf[c] = train_hf[c].asnumeric()
+        test_hf[c] = test_hf[c].asnumeric()
+    
+    train_s,valid_s = train_hf.split_frame(ratios=[.90], seed=615)
+
+    response = 'target'
+    class_col = [c for c in train_hf.drop('target').col_names if c not in ['AttributedProviderId', 'b_target',
+             'splitcost_avg', 'MEAN(data.SplitCost)']]
+
+### removing vpac last gave the best results
+    target_names = ['low','medium','high']
+
+    from h2o.estimators import H2ORandomForestEstimator, H2OGradientBoostingEstimator, H2ONaiveBayesEstimator, H2ODeepLearningEstimator
+    from h2o.grid.grid_search import H2OGridSearch
+
+    from sklearn.metrics import classification_report
+#    from sklearn.metrics import precision_score, roc_curve
+
+    estimator = H2ORandomForestEstimator(
+    # Stops fitting new trees when 10-tree rolling average is within 0.00001
+        stopping_rounds = 10,
+        stopping_tolerance = 0.00001,
+        stopping_metric = 'auto',
+        score_each_iteration = True,
+        balance_classes = True,
+        seed = 615)
+
+    hyper_parameters = {'ntrees':[100, 200, 300, 400, 500, 600, 700, 800, 900, 1000], 
+                    'max_depth':[2, 4, 6, 8, 10, 12, 14, 16, 18, 20]}
+
+    criteria = {"strategy": "RandomDiscrete", 
+            "stopping_rounds": 3,
+            "stopping_tolerance": 0.00001,
+            "stopping_metric": "misclassification"}
+
+    grid_search = H2OGridSearch(model = estimator, 
+                            hyper_params = hyper_parameters,
+                            search_criteria = criteria)
+
+
+    grid_search.train(x = class_col,
+                  y = response,
+                  training_frame = train_s,
+                  validation_frame = valid_s)
+
+    sorted_grid = grid_search.get_grid(sort_by='mean_per_class_error',decreasing=True)
+    print('Best model sorted by auc:\n', sorted_grid.models[0])
+
+    best_max_depth  = sorted_grid.sorted_metric_table()['max_depth'][0]
+    print("best max depth:", best_max_depth)
+    best_ntrees     = sorted_grid.sorted_metric_table()['ntrees'][0]
+    print("best n_trees:", best_ntrees)
+    best_mpce        = sorted_grid.sorted_metric_table()['mean_per_class_error'][0]
+    print("best mean per class error:", best_mpce)
+    sorted_grid_mpce = grid_search.get_grid(sort_by='mean_per_class_error',decreasing=True)
+    best_mpce = sorted_grid_mpce.sorted_metric_table()['mean_per_class_error'][0]
+
+
+    best_rf = H2ORandomForestEstimator(
+    model_id = "best_rf",
+    ntrees = int(best_ntrees),
+    max_depth = int(best_max_depth),
+    stopping_rounds = 5,
+    score_each_iteration = True,
+    seed = 615,
+#    balance_classes=True,
+    nfolds=5)
+
+    best_rf.train(class_col, 
+              response, 
+              training_frame = train_s, 
+              validation_frame = test_hf)
+
+## model predictions
+    best_rf_pred = best_rf.predict(test_hf).as_data_frame()
+
+    prediction_bucket = best_rf_pred.loc[:, best_rf_pred.columns != 'predict'].idxmax(axis=1)#.reset_index(drop=True)
+    predictor_score = best_rf_pred.max(axis=1).reset_index(drop=True)
+    model_selection = pd.DataFrame(data=dict(prediction_bucket=prediction_bucket,predictor_score=predictor_score), index=prediction_bucket.index)
+    original_test = p_combo[p_combo.set=='test'][['AttributedProviderId']]#,'splitcost_avg','target']]
+    original_test.reset_index(inplace=True)
+
+    x=pd.merge(original_test, model_selection, left_index=True, right_index=True)
+    model_select = x.drop('index', axis=1)
+    var_best_rf = best_rf._model_json['output']['variable_importances'].as_data_frame()
+
+    model_select.to_csv(path + "rf_pred" + filename, index=False)
+    var_best_rf.to_csv(path + "rf_var_imp" + filename, index=False)
+
+    print(classification_report(test['target'], best_rf_pred['predict'], target_names))
+    
+#    h2o.cluster().shutdown()
+    return 
+
+if __name__ == '__main__':   
+    path = 'Z:\AnalyticsShared\PNO\KNRPL\model_output\\'
+    spec = importlib.util.spec_from_file_location("knrpl_sql_load","Z:\AnalyticsShared\PNO\KNRPL\python_script\\knrpl_sql_load.py")
+    knrpl = importlib.util.module_from_spec(spec)
+    model(cnxn,cursor,path,knrpl)
+    print("KNRPL complete")
+    
+    path = 'Z:\AnalyticsShared\PNO\BARI\model_selection\\'
+    spec = importlib.util.spec_from_file_location("bari_sql_load","Z:\AnalyticsShared\PNO\BARI\python_script\\bari_sql_load.py")
+    bari = importlib.util.module_from_spec(spec)
+    model(cnxn,cursor,path,bari)
+    print("BARI complete")
+    
+    path = 'Z:\AnalyticsShared\PNO\BSTBIO\model_output\\'
+    spec = importlib.util.spec_from_file_location("bstbio_sql_load","Z:\AnalyticsShared\PNO\BSTBIO\python_script\\bstbio_sql_load.py")
+    bstbio = importlib.util.module_from_spec(spec)
+    model(cnxn,cursor,path,bstbio)
+    print("BSTBIO complete")
+    
+    path = 'Z:\AnalyticsShared\PNO\COLON\model_output\\'
+    spec = importlib.util.spec_from_file_location("colon_sql_load","Z:\AnalyticsShared\PNO\COLON\python_script\\colon_sql_load.py")
+    colon = importlib.util.module_from_spec(spec)
+    model(cnxn,cursor,path,colon)
+    print("COLON complete")
+    
+    path = 'Z:\AnalyticsShared\PNO\COLOS\model_output\\'
+    spec = importlib.util.spec_from_file_location("colos_sql_load","Z:\AnalyticsShared\PNO\COLOS\python_script\\colos_sql_load.py")
+    colos = importlib.util.module_from_spec(spec)
+    model(cnxn,cursor,path,colos)
+    print("COLOS complete")
+    
+    path = 'Z:\AnalyticsShared\PNO\CTRTSU\model_output\\'
+    spec = importlib.util.spec_from_file_location("ctrtsu_sql_load","Z:\AnalyticsShared\PNO\CTRTSU\python_script\\ctrtsu_sql_load.py")
+    ctrtsu= importlib.util.module_from_spec(spec)
+    model(cnxn,cursor,path,ctrtsu)
+    print("CTRSU complete")
+    
+    path = 'Z:\AnalyticsShared\PNO\CXCABG\model_output\\'
+    spec = importlib.util.spec_from_file_location("cxcabg_sql_load","Z:\AnalyticsShared\PNO\CXCABG\python_script\\cxcabg_sql_load.py")
+    cxcabg = importlib.util.module_from_spec(spec)
+    model(cnxn,cursor,path, cxcabg)
+    print("CXCABG complete")
+    
+    path = 'Z:\AnalyticsShared\PNO\EGD\model_output\\'
+    spec = importlib.util.spec_from_file_location("egd_sql_load","Z:\AnalyticsShared\PNO\EGD\python_script\\egd_sql_load.py")
+    egd = importlib.util.module_from_spec(spec)
+    model(cnxn,cursor,path, egd)
+    print("EGD complete")
+    
+    path = 'Z:\AnalyticsShared\PNO\FUSION\model_output\\'
+    spec = importlib.util.spec_from_file_location("fusion_sql_load","Z:\AnalyticsShared\PNO\FUSION\python_script\\fusion_sql_load.py")
+    fusion = importlib.util.module_from_spec(spec)
+    model(cnxn,cursor,path, fusion)
+    print("FUSION complete")
+    
+    path = 'Z:\AnalyticsShared\PNO\GBSURG\model_output\\'
+    spec = importlib.util.spec_from_file_location("gbsurg_sql_load","Z:\AnalyticsShared\PNO\GBSURG\python_script\\gbsurg_sql_load.py")
+    gbsurg = importlib.util.module_from_spec(spec)
+    model(cnxn,cursor,path, gbsurg)
+    print("GBSURG complete")
+    
+    path = 'Z:\AnalyticsShared\PNO\HIPRPL\model_output\\'
+    spec = importlib.util.spec_from_file_location("hiprprl_sql_load","Z:\AnalyticsShared\PNO\HIPRPL\python_script\\hiprpl_sql_load.py")
+    hiprprl = importlib.util.module_from_spec(spec)
+    model(cnxn,cursor,path, hiprprl)
+    print("HIPRPRL complete")
+    
+    path = 'Z:\AnalyticsShared\PNO\HYST\model_output\\'
+    spec = importlib.util.spec_from_file_location("hyst_sql_load","Z:\AnalyticsShared\PNO\HYST\python_script\\hyst_sql_load.py")
+    hyst = importlib.util.module_from_spec(spec)
+    model(cnxn,cursor,path, hyst)
+    print("HYST complete")
+    
+    path = 'Z:\AnalyticsShared\PNO\KNARTH\model_output\\'
+    spec = importlib.util.spec_from_file_location("knarth_sql_load","Z:\AnalyticsShared\PNO\KNARTH\python_script\\knarth_sql_load.py")
+    knarth = importlib.util.module_from_spec(spec)
+    model(cnxn,cursor,path, knarth)
+    print("KNARTH complete")
+    
+    path = 'Z:\AnalyticsShared\PNO\LBRLAM\model_output\\'
+    spec = importlib.util.spec_from_file_location("lbrlam_sql_load","Z:\AnalyticsShared\PNO\LBRLAM\python_script\\lbrlam_sql_load.py")
+    lbrlam = importlib.util.module_from_spec(spec)
+    model(cnxn,cursor,path, lbrlam)
+    print("LBRLAM complete")
+    
+    path = 'Z:\AnalyticsShared\PNO\LNGSRG\model_output\\'
+    spec = importlib.util.spec_from_file_location("lngsrg_sql_load","Z:\AnalyticsShared\PNO\LNGSRG\python_script\\lngsrg_sql_load.py")
+    lngsrg = importlib.util.module_from_spec(spec)
+    model(cnxn,cursor,path, lngsrg)
+    print("LNGSRG complete")
+    
+    path = 'Z:\AnalyticsShared\PNO\MSTCMY\model_output\\'
+    spec = importlib.util.spec_from_file_location("mstcmy_sql_load","Z:\AnalyticsShared\PNO\MSTCMY\python_script\\mstcmy_sql_load.py")
+    mstcmy = importlib.util.module_from_spec(spec)
+    model(cnxn,cursor,path, mstcmy)
+    print("MSTCMY complete")
+    
+    path = 'Z:\AnalyticsShared\PNO\PCI\model_output\\'
+    spec = importlib.util.spec_from_file_location("pci_sql_load","Z:\AnalyticsShared\PNO\PCI\python_script\\pci_sql_load.py")
+    pci = importlib.util.module_from_spec(spec)
+    model(cnxn,cursor,path, pci)
+    print("PCI complete")
+    
+    path = 'Z:\AnalyticsShared\PNO\PCMDFR\model_output\\'
+    spec = importlib.util.spec_from_file_location("pcmdfr_sql_load","Z:\AnalyticsShared\PNO\PCMDFR\python_script\\pcmdfr_sql_load.py")
+    pcmdfr = importlib.util.module_from_spec(spec)
+    model(cnxn,cursor,path, pcmdfr)
+    print("PCMDFR complete")
+    
+    path = 'Z:\AnalyticsShared\PNO\PRSCMY\model_output\\' 
+    spec = importlib.util.spec_from_file_location("prscmy_sql_load","Z:\AnalyticsShared\PNO\PRSCMY\python_script\\prscmy_sql_load.py")
+    prscmy = importlib.util.module_from_spec(spec)
+    model(cnxn,cursor,path, prscmy)
+    print("PRSCMY complete")
+    
+    path = 'Z:\AnalyticsShared\PNO\SHLDRP\model_output\\'
+    spec = importlib.util.spec_from_file_location("shldrp_sql_load","Z:\AnalyticsShared\PNO\SHLDRP\python_script\\shldrp_sql_load.py")
+    shldrp = importlib.util.module_from_spec(spec)
+    model(cnxn,cursor,path, shldrp)
+    print("SHLDRP complete")
+    
+    path = 'Z:\AnalyticsShared\PNO\TONSIL\model_output\\'
+    spec = importlib.util.spec_from_file_location("tonsil_sql_load","Z:\AnalyticsShared\PNO\TONSIL\python_script\\tonsil_sql_load.py")
+    tonsil = importlib.util.module_from_spec(spec)
+    model(cnxn,cursor,path, tonsil)
+    print("TONSIL complete")
+    
+    path = 'Z:\AnalyticsShared\PNO\TURP\model_output\\'
+    spec = importlib.util.spec_from_file_location("turp_sql_load","Z:\AnalyticsShared\PNO\TURP\python_script\\turp_sql_load.py")
+    turp = importlib.util.module_from_spec(spec)
+    model(cnxn,cursor,path, turp)
+    print("TURP complete")
+    
+    path = 'Z:\AnalyticsShared\PNO\PREGN\model_output\\'
+    spec = importlib.util.spec_from_file_location("preg_sql_load","Z:\AnalyticsShared\PNO\PREGN\python_script\\preg_sql_load.py")
+    pregn = importlib.util.module_from_spec(spec)
+    model(cnxn,cursor,path,pregn)
+    print("PREGN complete")
+
+    h2o.cluster().shutdown()
