@@ -22,11 +22,11 @@ h2o.init()
 
 
 cnxn = pyodbc.connect("Driver={SQL Server Native Client 11.0};"
-                      "Server=10.235.135.40;"
-                      "Database=hor_com_q_ecr_34;"
+                      "Server=XXXXXX;"
+                      "Database=XXXXX;"
                       "Trusted_Connection=yes;"
                       "user=mlefebvre;"
-                      "password=FirstLogin!10042018;")
+                      "password=XXXXX;")
 
 cursor = cnxn.cursor()
 #########################
@@ -363,7 +363,7 @@ def model(cnxn,cursor,path,episode):
 #    h2o.cluster().shutdown()
     return 
 
-if __name__ == '__main__':   
+#if __name__ == '__main__':   
     path = 'Z:\AnalyticsShared\PNO\KNRPL\model_output\\'
     spec = importlib.util.spec_from_file_location("knrpl_sql_load","Z:\AnalyticsShared\PNO\KNRPL\python_script\\knrpl_sql_load.py")
     knrpl = importlib.util.module_from_spec(spec)
